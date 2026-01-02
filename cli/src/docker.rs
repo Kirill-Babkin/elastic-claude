@@ -71,12 +71,12 @@ pub async fn create_container(docker: &Docker, password: &str, db_name: &str) ->
         ..Default::default()
     };
 
+    let env_password = format!("POSTGRES_PASSWORD={}", password);
+    let env_db_name = format!("POSTGRES_DB={}", db_name);
+
     let config = Config {
         image: Some(IMAGE_NAME),
-        env: Some(vec![
-            &format!("POSTGRES_PASSWORD={}", password),
-            &format!("POSTGRES_DB={}", db_name),
-        ]),
+        env: Some(vec![&env_password, &env_db_name]),
         host_config: Some(host_config),
         ..Default::default()
     };

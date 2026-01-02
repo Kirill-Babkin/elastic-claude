@@ -1,65 +1,55 @@
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
-use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use crate::config::Config;
+use super::current_chat::extract_text_from_jsonl;
 
 pub async fn run(session_file: PathBuf) -> Result<()> {
     if !session_file.exists() {
         bail!("Session file not found: {}", session_file.display());
     }
 
-    let prompt = format!(
-        r#"Use the elastic-claude skill to ingest this chat session.
-File: {}
+    // Read the chat content
+    let raw_content = std::fs::read_to_string(&session_file)
+        .with_context(|| format!("Failed to read chat file: {}", session_file.display()))?;
 
-Parse the conversation, extract topics and metadata,
-store as entry_type='chat'."#,
-        session_file.display()
-    );
+    // Extract plain text from JSONL for proper full-text indexing
+    let content = extract_text_from_jsonl(&raw_content);
 
-    spawn_claude(&prompt).await
-}
+    if content.is_empty() {
+        bail!("No text content found in chat file");
+    }
 
-async fn spawn_claude(prompt: &str) -> Result<()> {
-    let mut child = Command::new("claude")
-        .arg("--print")
-        .arg(prompt)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Failed to spawn Claude Code. Is it installed?")?;
+    let file_path = session_file.to_string_lossy().to_string();
 
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
+    // Connect to database and insert
+    let config = Config::load().context("elastic-claude not initialized. Run 'elastic-claude init' first.")?;
 
-    let stdout_reader = BufReader::new(stdout);
-    let stderr_reader = BufReader::new(stderr);
+    let (client, connection) =
+        tokio_postgres::connect(&config.connection_string(), tokio_postgres::NoTls)
+            .await
+            .context("Failed to connect to database")?;
 
-    let mut stdout_lines = stdout_reader.lines();
-    let mut stderr_lines = stderr_reader.lines();
-
-    loop {
-        tokio::select! {
-            line = stdout_lines.next_line() => {
-                match line? {
-                    Some(line) => println!("{}", line),
-                    None => break,
-                }
-            }
-            line = stderr_lines.next_line() => {
-                match line? {
-                    Some(line) => eprintln!("{}", line),
-                    None => {}
-                }
-            }
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Database connection error: {}", e);
         }
-    }
+    });
 
-    let status = child.wait().await?;
-    if !status.success() {
-        bail!("Claude Code exited with error");
-    }
+    let row = client
+        .query_one(
+            r#"
+            INSERT INTO entries (entry_type, content, file_path, metadata)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id
+            "#,
+            &[&"chat", &content, &Some(&file_path), &serde_json::json!({})],
+        )
+        .await
+        .context("Failed to insert chat entry")?;
+
+    let id: i32 = row.get(0);
+    println!("Inserted chat with id: {}", id);
+    println!("Chat file: {}", file_path);
 
     Ok(())
 }

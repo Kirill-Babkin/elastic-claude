@@ -7,43 +7,97 @@ description: Index and search project knowledge. Use when starting a new task to
 
 Local search infrastructure for project knowledge.
 
-## Config
+## CLI Commands
 
-Read connection from `~/.elastic-claude/config.yaml`:
+### Add an entry
 
-```yaml
-database:
-  host: localhost
-  port: 5433
-  name: elastic_claude
-  user: postgres
-  password: elastic
+```bash
+# From file path (preferred - Rust reads the file)
+elastic-claude add -t <type> -p <file_path> [-m '<json_metadata>']
+
+# Inline content (for small content)
+elastic-claude add -t <type> -c "<content>" [-m '<json_metadata>']
+
+# From stdin
+cat <file> | elastic-claude add -t <type> [-m '<json_metadata>']
 ```
 
-## Schema
+Arguments:
+- `-t, --entry-type`: Entry type (e.g., "document", "chat", "code")
+- `-p, --path`: Read content from file (also sets file_path in DB)
+- `-c, --content`: Inline content (conflicts with -p)
+- `-m, --metadata`: JSON metadata (optional)
 
-See [references/schema.md](references/schema.md)
-
-## Ingest
-
-Read files, extract metadata based on content/path, insert into entries table.
-
-Example insert:
-```sql
-INSERT INTO entries (entry_type, content, metadata, file_path)
-VALUES ('document', $content, $metadata::jsonb, $path);
+Example:
+```bash
+elastic-claude add -t document -p /path/to/file.md -m '{"project": "my-project", "title": "My Doc", "category": "docs"}'
 ```
 
-## Search
+### Search entries
 
-Use tsvector full-text search, return ranked results with snippets:
-
-```sql
-SELECT id, entry_type, file_path, metadata,
-       ts_headline('english', content, query) as snippet,
-       ts_rank(content_tsv, query) as rank
-FROM entries, to_tsquery('english', $search_terms) query
-WHERE content_tsv @@ query
-ORDER BY rank DESC
-LIMIT 10;
+```bash
+elastic-claude search "<query>"
 ```
+
+Returns matching entries with snippets, scores, and metadata.
+
+### Save current chat session
+
+```bash
+# Get path to current chat file
+elastic-claude current-chat --path-only
+
+# Ingest current chat with metadata (always include project)
+elastic-claude current-chat -m '{"project": "my-project", "title": "Session title", "tags": ["topic1", "topic2"]}'
+```
+
+Auto-detects the current Claude session and ingests the chat file.
+
+### Get entry by ID
+
+```bash
+# Get full entry details
+elastic-claude get <id>
+
+# Get just the content
+elastic-claude get <id> --content-only
+
+# Show tsvector tokens (for debugging search)
+elastic-claude get <id> --tsv
+```
+
+## Workflow for Ingesting Documents
+
+When asked to ingest files:
+
+1. Determine the project name from the current working directory or ask the user
+2. Read each file's content
+3. Extract metadata from content and path:
+   - project: **always include** - the project/repo name
+   - title: from first heading or filename
+   - category: from directory path
+   - tags: from content keywords
+4. Call `elastic-claude add` for each file
+
+Example for a markdown file:
+```bash
+elastic-claude add -t document -p /path/to/file.md -m '{"project": "CQR", "title": "Extracted Title", "category": "documentation"}'
+```
+
+## Workflow for Searching
+
+When asked to find information:
+
+1. Run `elastic-claude search "<relevant keywords>"`
+2. Review the results (snippets, file paths, metadata)
+3. If needed, read the full files for more context
+4. Summarize findings for the user
+
+## Schema Reference
+
+See [references/schema.md](references/schema.md) for database schema details.
+
+Entry types:
+- `document`: Markdown docs, READMEs, etc.
+- `chat`: Chat session transcripts
+- `code`: Code snippets or files

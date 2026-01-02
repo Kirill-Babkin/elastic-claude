@@ -1,57 +1,67 @@
-use anyhow::{bail, Context, Result};
-use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use anyhow::{Context, Result};
+use crate::config::Config;
 
 pub async fn run(query: String) -> Result<()> {
-    let prompt = format!(
-        r#"Use the elastic-claude skill to search for: {}
+    let config = Config::load().context("elastic-claude not initialized. Run 'elastic-claude init' first.")?;
 
-Return relevant entries with snippets and metadata."#,
-        query
-    );
+    let (client, connection) =
+        tokio_postgres::connect(&config.connection_string(), tokio_postgres::NoTls)
+            .await
+            .context("Failed to connect to database")?;
 
-    spawn_claude(&prompt).await
-}
-
-async fn spawn_claude(prompt: &str) -> Result<()> {
-    let mut child = Command::new("claude")
-        .arg("--print")
-        .arg(prompt)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Failed to spawn Claude Code. Is it installed?")?;
-
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-
-    let stdout_reader = BufReader::new(stdout);
-    let stderr_reader = BufReader::new(stderr);
-
-    let mut stdout_lines = stdout_reader.lines();
-    let mut stderr_lines = stderr_reader.lines();
-
-    loop {
-        tokio::select! {
-            line = stdout_lines.next_line() => {
-                match line? {
-                    Some(line) => println!("{}", line),
-                    None => break,
-                }
-            }
-            line = stderr_lines.next_line() => {
-                match line? {
-                    Some(line) => eprintln!("{}", line),
-                    None => {}
-                }
-            }
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Database connection error: {}", e);
         }
+    });
+
+    // Convert query to tsquery format (space-separated words become AND)
+    let tsquery = query
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" & ");
+
+    let rows = client
+        .query(
+            r#"
+            SELECT id, entry_type, file_path, metadata,
+                   ts_headline('english', content, query,
+                       'MaxFragments=3, MaxWords=30, MinWords=15, FragmentDelimiter= ... ') as snippet,
+                   ts_rank(content_tsv, query) as rank
+            FROM entries, to_tsquery('english', $1) query
+            WHERE content_tsv @@ query
+            ORDER BY rank DESC
+            LIMIT 10
+            "#,
+            &[&tsquery],
+        )
+        .await
+        .context("Search query failed")?;
+
+    if rows.is_empty() {
+        println!("No results found for: {}", query);
+        return Ok(());
     }
 
-    let status = child.wait().await?;
-    if !status.success() {
-        bail!("Claude Code exited with error");
+    println!("Found {} results:\n", rows.len());
+
+    for row in rows {
+        let id: i32 = row.get("id");
+        let entry_type: &str = row.get("entry_type");
+        let file_path: Option<&str> = row.get("file_path");
+        let metadata: serde_json::Value = row.get("metadata");
+        let snippet: &str = row.get("snippet");
+        let rank: f32 = row.get("rank");
+
+        println!("--- Entry {} (score: {:.2}) ---", id, rank);
+        println!("Type: {}", entry_type);
+        if let Some(path) = file_path {
+            println!("File: {}", path);
+        }
+        if let Some(title) = metadata.get("title").and_then(|t| t.as_str()) {
+            println!("Title: {}", title);
+        }
+        println!("Snippet: {}...\n", snippet.trim());
     }
 
     Ok(())
